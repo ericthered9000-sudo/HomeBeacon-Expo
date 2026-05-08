@@ -1,6 +1,6 @@
 {
   "name": "homebeacon-expo",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -9,11 +9,20 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.1",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/netinfo": "11.5.2",
+    "@revenuecat/purchases-capacitor": "^13.0.1",
     "axios": "^1.13.6",
     "expo": "~55.0.8",
+    "expo-background-fetch": "~55.0.10",
+    "expo-battery": "~55.0.9",
+    "expo-build-properties": "^55.0.11",
+    "expo-dev-client": "~55.0.18",
+    "expo-location": "~55.1.4",
+    "expo-sensors": "~55.0.9",
     "expo-status-bar": "~55.0.4",
+    "expo-task-manager": "~55.0.10",
     "react": "19.2.0",
     "react-native": "0.83.2",
     "react-native-safe-area-context": "~5.6.2"

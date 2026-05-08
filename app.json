@@ -2,7 +2,7 @@
   "expo": {
     "name": "HomeBeacon",
     "slug": "homebeacon",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -16,7 +16,14 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.homebeacon.app"
+      "bundleIdentifier": "com.homebeacon.app",
+      "buildNumber": "2",
+      "infoPlist": {
+        "NSMotionUsageDescription": "HomeBeacon uses motion data to track your daily activity for wellness scoring.",
+        "NSHealthShareUsageDescription": "HomeBeacon reads step count from Apple Health for wellness tracking.",
+        "NSHealthUpdateUsageDescription": "HomeBeacon writes wellness data to Apple Health.",
+        "UIBackgroundModes": ["fetch", "processing"]
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -24,9 +31,15 @@
         "backgroundColor": "#4F46E5"
       },
       "package": "com.homebeacon.app",
+      "versionCode": 3,
       "permissions": [
         "INTERNET",
-        "ACCESS_NETWORK_STATE"
+        "ACCESS_NETWORK_STATE",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE",
+        "ACTIVITY_RECOGNITION"
       ]
     },
     "web": {
@@ -36,6 +49,20 @@
       "eas": {
         "projectId": "ee170c09-61db-4ceb-8b73-96abb1ec9b6f"
       }
-    }
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "compileSdkVersion": 36,
+            "targetSdkVersion": 35,
+            "buildToolsVersion": "35.0.0"
+          }
+        }
+      ]
+    ],
+    "privacyPolicyUrl": "https://site-delta-kohl-80.vercel.app/privacy-policy.html",
+    "termsOfServiceUrl": "https://site-delta-kohl-80.vercel.app/terms-of-service.html"
   }
 }

@@ -6,6 +6,7 @@ import {
   SafeAreaView,
   StatusBar,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
@@ -17,8 +18,14 @@ import { AuthScreen } from './src/screens/AuthScreen';
 import { PricingScreen } from './src/screens/PricingScreen';
 import { SeniorView } from './src/screens/SeniorView';
 import { FamilyView } from './src/screens/FamilyView';
-
-const API_URL = 'https://lucid-growth-production-c2f0.up.railway.app';
+import { ThemeProvider, useThemeColors } from './src/hooks/useThemeColors';
+import { ThemeName } from './src/config/theme';
+import { API_URL } from './src/config/api';
+import { logger } from './src/utils/logger';
+import { fetchWithRetry, safeJsonParse } from './src/utils/api';
+import { secureFetch, secureFetchJSON, checkSession, logout as authLogout } from './src/utils/auth';
+import { unifiedTracking } from './src/services/UnifiedTrackingService';
+import { initBilling, checkEntitlement, type Tier } from './src/lib/subscriptions';
 
 type AppState = 'loading' | 'auth' | 'pricing' | 'senior' | 'family';
 
@@ -28,15 +35,32 @@ interface User {
   role: 'senior' | 'family';
 }
 
-export default function App() {
+function AppContent() {
+  const { colors, currentTheme, setTheme } = useThemeColors();
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
   const [appState, setAppState] = useState<AppState>('loading');
+  const [subscriptionTier, setSubscriptionTier] = useState<Tier>('free');
   const [wellnessScore, setWellnessScore] = useState<number | undefined>(undefined);
   const [activities, setActivities] = useState<any[]>([]);
   const [alerts, setAlerts] = useState<string[]>([]);
   const [isOffline, setIsOffline] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+
+  // Load saved theme on mount
+  useEffect(() => {
+    loadSavedTheme();
+  }, []);
+
+  const loadSavedTheme = async () => {
+    try {
+      const savedTheme = await AsyncStorage.getItem('theme');
+      if (savedTheme && ['serene', 'ocean', 'sunset', 'forest'].includes(savedTheme)) {
+        setTheme(savedTheme as ThemeName);
+      }
+    } catch (err) {
+      logger.error('Failed to load theme:', err);
+    }
+  };
 
   // Check network connectivity
   useEffect(() => {
@@ -53,114 +77,161 @@ export default function App() {
 
   const checkExistingSession = async () => {
     try {
-      const storedToken = await AsyncStorage.getItem('token');
-      const storedUser = await AsyncStorage.getItem('user');
+      // Try to validate session via httpOnly cookie first
+      const sessionResult = await checkSession();
       
-      if (storedToken && storedUser) {
-        const parsedUser = JSON.parse(storedUser);
-        setUser(parsedUser);
-        setToken(storedToken);
-        setAppState(parsedUser.role === 'senior' ? 'senior' : 'family');
-        await fetchUserData(parsedUser, storedToken);
+      if (sessionResult.success && sessionResult.user) {
+        setUser(sessionResult.user);
+
+        // Check subscription status with custom Google Play Billing
+        await initBilling(sessionResult.user.id);
+        const { tier } = await checkEntitlement();
+        setSubscriptionTier(tier);
+
+        // If free tier, route to pricing screen first
+        if (tier === 'free') {
+          setAppState('pricing');
+        } else {
+          setAppState(sessionResult.user.role === 'senior' ? 'senior' : 'family');
+          await fetchUserData(sessionResult.user);
+        }
+
+        // Also store user locally for offline reference
+        await AsyncStorage.setItem('user', JSON.stringify(sessionResult.user));
       } else {
+        // No valid session, go to auth
         setAppState('auth');
       }
     } catch (err) {
-      console.error('Session check error:', err);
+      logger.error('Session check error:', err);
       setAppState('auth');
-    } finally {
-      // Loading state is handled by appState check
     }
   };
 
-  const fetchUserData = async (userData: User, authToken: string) => {
+  const fetchUserData = async (userData: User) => {
     try {
       setFetchError(null);
       
       if (userData.role === 'senior') {
-        await fetchSeniorData(userData.id, authToken);
+        await fetchSeniorData(userData.id);
       } else {
-        await fetchFamilyData(userData.id, authToken);
+        await fetchFamilyData(userData.id);
       }
     } catch (err) {
-      console.error('Fetch error:', err);
+      logger.error('Fetch error:', err);
       setFetchError('Failed to load data. Check connection.');
     }
   };
 
-  const fetchSeniorData = async (userId: string, authToken: string) => {
+  const fetchSeniorData = async (userId: string) => {
     try {
-      // Fetch wellness score
-      const wellnessRes = await fetch(`${API_URL}/api/wellness/${userId}`, {
-        headers: { 'Authorization': `Bearer ${authToken}` },
+      // Fetch wellness score with retry (auth via httpOnly cookie)
+      const wellnessRes = await fetchWithRetry(`${API_URL}/api/v1/wellness/${userId}`, {
+        credentials: 'include',
       });
       if (wellnessRes.ok) {
-        const wellnessData = await wellnessRes.json();
-        setWellnessScore(wellnessData.score);
+        const wellnessData = await safeJsonParse(wellnessRes);
+        if (wellnessData?.score !== undefined) {
+          setWellnessScore(wellnessData.score);
+        }
       }
 
-      // Fetch activities
-      const activityRes = await fetch(`${API_URL}/api/activity/${userId}?limit=10`, {
-        headers: { 'Authorization': `Bearer ${authToken}` },
+      // Fetch activities with retry (auth via httpOnly cookie)
+      const activityRes = await fetchWithRetry(`${API_URL}/api/v1/activity/${userId}?limit=10`, {
+        credentials: 'include',
       });
       if (activityRes.ok) {
-        const activityData = await activityRes.json();
-        setActivities(activityData.map((a: any) => ({
-          type: a.type,
-          time: new Date(a.timestamp).toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: true,
-          }),
-        })));
-      }
-    } catch (err) {
-      console.error('Failed to fetch senior data:', err);
-      throw err;
-    }
-  };
-
-  const fetchFamilyData = async (userId: string, authToken: string) => {
-    try {
-      // Family members fetch their connected senior's data
-      // This will be updated when family connections are properly implemented
-      const connectionsRes = await fetch(`${API_URL}/api/connections/family/${userId}`, {
-        headers: { 'Authorization': `Bearer ${authToken}` },
-      });
-      
-      if (connectionsRes.ok) {
-        const connections = await connectionsRes.json();
-        if (connections.length > 0) {
-          // Fetch the first senior's data
-          const seniorId = connections[0].senior_id;
-          await fetchSeniorData(seniorId, authToken);
+        const activityData = await safeJsonParse(activityRes);
+        if (activityData && Array.isArray(activityData)) {
+          setActivities(activityData.map((a: any) => ({
+            type: a.type,
+            time: new Date(a.timestamp).toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+              hour12: true,
+            }),
+          })));
         }
       }
     } catch (err) {
-      console.error('Failed to fetch family data:', err);
-      throw err;
+      logger.error('Failed to fetch senior data:', err);
+      // Don't throw - allow app to continue with partial data
     }
   };
 
-  const handleAuth = async (userData: User, authToken: string) => {
-    setUser(userData);
-    setToken(authToken);
-    // Show pricing for new users (skip for now, go directly to app)
-    setAppState(userData.role === 'senior' ? 'senior' : 'family');
-    await fetchUserData(userData, authToken);
+  const fetchFamilyData = async (userId: string) => {
+    try {
+      const connectionsRes = await fetchWithRetry(`${API_URL}/api/v1/connections/family/${userId}`, {
+        credentials: 'include',
+      });
+      
+      if (connectionsRes.ok) {
+        const connections = await safeJsonParse(connectionsRes);
+        if (connections && Array.isArray(connections) && connections.length > 0) {
+          const seniorId = connections[0]?.senior_id;
+          if (seniorId) {
+            await fetchSeniorData(seniorId);
+          }
+        }
+      }
+    } catch (err) {
+      logger.error('Failed to fetch family data:', err);
+      // Don't throw - allow app to continue with partial data
+    }
   };
 
-  const handlePricingComplete = () => {
+  const handleAuth = async (userData: User) => {
+    setUser(userData);
+
+    // Check subscription status after auth
+    await initBilling(userData.id);
+    const { tier } = await checkEntitlement();
+    setSubscriptionTier(tier);
+
+    // If free tier, route to pricing screen
+    if (tier === 'free') {
+      setAppState('pricing');
+      return;
+    }
+
+    setAppState(userData.role === 'senior' ? 'senior' : 'family');
+    await fetchUserData(userData);
+    
+    // Start all tracking services for seniors (opt-in, default enabled)
+    if (userData.role === 'senior') {
+      try {
+        const trackingEnabled = await AsyncStorage.getItem('passive-tracking-enabled');
+        if (trackingEnabled !== 'false') {
+          // Default to enabled for new users, respects user choice for returning
+          const result = await unifiedTracking.startAll();
+          if (!result.success) {
+            logger.error('Some tracking services failed to start:', result.errors);
+          } else {
+            logger.info('All tracking services started successfully');
+          }
+        }
+      } catch (error) {
+        logger.error('Failed to start tracking services:', error);
+      }
+    }
+  };
+
+  const handlePricingComplete = async () => {
     if (user) {
+      // Re-check subscription after pricing is complete
+      const { tier } = await checkEntitlement();
+      setSubscriptionTier(tier);
       setAppState(user.role === 'senior' ? 'senior' : 'family');
+      await fetchUserData(user);
     }
   };
 
   const handleLogout = async () => {
-    await AsyncStorage.removeItem('token');
+    // Clear the httpOnly cookie via backend
+    await authLogout();
+    // Clear local user data
     await AsyncStorage.removeItem('user');
     setUser(null);
-    setToken(null);
     setAppState('auth');
     setWellnessScore(undefined);
     setActivities([]);
@@ -168,24 +239,18 @@ export default function App() {
   };
 
   const handleBack = () => {
-    // Show pricing or settings view
-    // For now, just logout
     handleLogout();
   };
 
   const handleRecordActivity = async (type: string) => {
-    if (!user || !token) return;
-    
-    if (isOffline) {
-      return;
-    }
+    if (!user || isOffline) return;
     
     try {
-      await fetch(`${API_URL}/api/activity`, {
+      await fetchWithRetry(`${API_URL}/api/v1/activity`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           userId: user.id,
@@ -194,25 +259,23 @@ export default function App() {
         }),
       });
       
-      await fetchSeniorData(user.id, token);
+      if (user.role === 'senior') {
+        await fetchSeniorData(user.id);
+      }
     } catch (err: any) {
-      console.error('Failed to record activity:', err);
+      logger.error('Failed to record activity:', err);
     }
   };
 
   const handleCheckIn = async () => {
-    if (!user || !token) return;
-    
-    if (isOffline) {
-      return;
-    }
-    
+    if (!user || isOffline) return;
+
     try {
-      await fetch(`${API_URL}/api/checkin`, {
+      const response = await fetchWithRetry(`${API_URL}/api/v1/checkin`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           userId: user.id,
@@ -220,26 +283,30 @@ export default function App() {
           message: 'I am doing great!',
         }),
       });
-      
-      await fetchSeniorData(user.id, token);
+
+      if (!response.ok) {
+        Alert.alert('Check-in failed', 'Could not complete your check-in. Please try again.');
+        return;
+      }
+
+      if (user.role === 'senior') {
+        await fetchSeniorData(user.id);
+      }
     } catch (err: any) {
-      console.error('Failed to send check-in:', err);
+      logger.error('Failed to send check-in:', err);
+      Alert.alert('Check-in failed', 'Could not complete your check-in. Please try again.');
     }
   };
 
   const handleRequestCheckIn = async (message: string) => {
-    if (!user || !token) return;
-    
-    if (isOffline) {
-      return;
-    }
+    if (!user || isOffline) return;
     
     try {
-      await fetch(`${API_URL}/api/checkin`, {
+      await fetchWithRetry(`${API_URL}/api/v1/checkin`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           userId: user.id,
@@ -248,24 +315,29 @@ export default function App() {
         }),
       });
     } catch (err: any) {
-      console.error('Failed to send request:', err);
+      logger.error('Failed to send request:', err);
     }
   };
 
   const handleRetry = async () => {
-    if (user && token) {
+    if (user) {
       setAppState('loading');
-      await fetchUserData(user, token);
+      await fetchUserData(user);
       setAppState(user.role === 'senior' ? 'senior' : 'family');
     }
+  };
+
+  const handleChangeTheme = async (newTheme: ThemeName) => {
+    setTheme(newTheme);
+    await AsyncStorage.setItem('theme', newTheme);
   };
 
   // Loading state
   if (appState === 'loading') {
     return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar barStyle="dark-content" backgroundColor="#fff" />
-        <LoadingScreen message="Loading HomeBeacon..." />
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.surface }]}>
+        <StatusBar barStyle={currentTheme === 'serene' ? 'light-content' : 'dark-content'} backgroundColor={colors.surface} />
+        <LoadingScreen message="Loading HomeBeacon..." colors={colors} />
         <OfflineBanner />
         <OfflineIndicator isOffline={isOffline} onRetry={handleRetry} />
       </SafeAreaView>
@@ -276,9 +348,9 @@ export default function App() {
   if (appState === 'auth') {
     return (
       <ErrorBoundary>
-        <SafeAreaView style={styles.container}>
-          <StatusBar barStyle="dark-content" backgroundColor="#fff" />
-          <AuthScreen onAuth={handleAuth} />
+        <SafeAreaView style={[styles.container, { backgroundColor: colors.surface }]}>
+          <StatusBar barStyle="dark-content" backgroundColor={colors.surface} />
+          <AuthScreen onAuth={handleAuth} colors={colors} />
           <OfflineBanner />
           <OfflineIndicator isOffline={isOffline} onRetry={handleRetry} />
         </SafeAreaView>
@@ -287,16 +359,16 @@ export default function App() {
   }
 
   // Pricing state
-  if (appState === 'pricing' && user && token) {
+  if (appState === 'pricing' && user) {
     return (
       <ErrorBoundary>
-        <SafeAreaView style={styles.container}>
-          <StatusBar barStyle="dark-content" backgroundColor="#fff" />
+        <SafeAreaView style={[styles.container, { backgroundColor: colors.surface }]}>
+          <StatusBar barStyle="dark-content" backgroundColor={colors.surface} />
           <PricingScreen
             user={user}
-            token={token}
             onSubscriptionComplete={handlePricingComplete}
             onSkip={handlePricingComplete}
+            colors={colors}
           />
           <OfflineBanner />
           <OfflineIndicator isOffline={isOffline} onRetry={handleRetry} />
@@ -317,6 +389,9 @@ export default function App() {
           onBack={handleBack}
           onRecordActivity={handleRecordActivity}
           onCheckIn={handleCheckIn}
+          colors={colors}
+          currentTheme={currentTheme}
+          onChangeTheme={handleChangeTheme}
         />
       </ErrorBoundary>
     );
@@ -335,6 +410,9 @@ export default function App() {
           onLogout={handleLogout}
           onBack={handleBack}
           onRequestCheckIn={handleRequestCheckIn}
+          colors={colors}
+          currentTheme={currentTheme}
+          onChangeTheme={handleChangeTheme}
         />
       </ErrorBoundary>
     );
@@ -342,20 +420,27 @@ export default function App() {
 
   // Fallback
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" backgroundColor="#fff" />
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.surface }]}>
+      <StatusBar barStyle="dark-content" backgroundColor={colors.surface} />
       <View style={styles.errorContainer}>
-        <ActivityIndicator size="large" color="#6366f1" />
-        <Text style={styles.errorText}>Loading...</Text>
+        <ActivityIndicator size="large" color={colors.primary} />
+        <Text style={[styles.errorText, { color: colors.textSecondary }]}>Loading...</Text>
       </View>
     </SafeAreaView>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider defaultTheme="serene">
+      <AppContent />
+    </ThemeProvider>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#fff',
   },
   errorContainer: {
     flex: 1,
@@ -365,6 +450,5 @@ const styles = StyleSheet.create({
   errorText: {
     marginTop: 12,
     fontSize: 16,
-    color: '#64748b',
   },
 });

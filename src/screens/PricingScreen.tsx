@@ -8,15 +8,42 @@ import {
   ActivityIndicator,
   Alert,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_URL } from '../config/api';
+import { ThemeColors } from '../config/theme';
+import {
+  initBilling,
+  getSubscriptionStatus,
+  purchaseSubscription,
+  verifyPurchaseWithBackend,
+  isBillingUnavailable,
+  type Tier,
+} from '../lib/subscriptions';
 
 interface PricingScreenProps {
   user: any;
-  token: string;
   onSubscriptionComplete: () => void;
   onSkip?: () => void;
+  colors?: ThemeColors;
 }
+
+// Default colors
+const defaultColors: ThemeColors = {
+  primary: '#006778',
+  primaryLight: '#86d2e5',
+  primaryDark: '#004e5c',
+  secondary: '#4D626C',
+  tertiary: '#5E799C',
+  background: '#f5f5f5',
+  surface: '#ffffff',
+  card: '#ffffff',
+  text: '#1a1a1a',
+  textSecondary: '#657a85',
+  border: '#e2e8f0',
+  error: '#dc2626',
+  success: '#22c55e',
+  warning: '#f97316',
+  sos: '#dc2626',
+};
 
 interface Plan {
   name: string;
@@ -27,15 +54,20 @@ interface Plan {
   features: string[];
 }
 
-export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: PricingScreenProps) {
+export function PricingScreen({ user, onSubscriptionComplete, onSkip, colors = defaultColors }: PricingScreenProps) {
   const [billing, setBilling] = useState<'monthly' | 'annual'>('monthly');
-  const [loading, setLoading] = useState(false);
   const [currentPlan, setCurrentPlan] = useState<string>('free');
   const [plans, setPlans] = useState<Record<string, Plan>>({});
+  const [purchasing, setPurchasing] = useState(false);
+  const [billingUnavailable, setBillingUnavailable] = useState(false);
 
   useEffect(() => {
     fetchPlans();
     fetchCurrentPlan();
+    setBillingUnavailable(isBillingUnavailable);
+    initBilling()
+      .then((ok) => { if (!ok) setBillingUnavailable(true); })
+      .catch(() => setBillingUnavailable(true));
   }, []);
 
   const fetchPlans = async () => {
@@ -43,7 +75,21 @@ export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: P
       const response = await fetch(`${API_URL}/api/subscriptions/plans`);
       const data = await response.json();
       if (data.success) {
-        setPlans(data.plans);
+        const plansArray = Array.isArray(data.plans) ? data.plans : [];
+        const normalized: Record<string, Plan> = Object.fromEntries(
+          plansArray.map((p: any) => {
+            const plan: Plan = {
+              name: p.name || p.id,
+              monthly: typeof p.price_monthly === 'number' ? p.price_monthly : p.monthly || 0,
+              annual: typeof p.price_annual === 'number' ? p.price_annual : p.annual || 0,
+              max_seniors: typeof p.max_seniors === 'number' ? p.max_seniors : 1,
+              max_family_members: typeof p.max_family_members === 'number' ? p.max_family_members : 1,
+              features: Array.isArray(p.features) ? p.features : [],
+            };
+            return [p.id, plan];
+          })
+        );
+        setPlans(normalized);
       }
     } catch (error) {
       console.error('Failed to fetch plans:', error);
@@ -52,14 +98,9 @@ export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: P
 
   const fetchCurrentPlan = async () => {
     try {
-      const response = await fetch(`${API_URL}/api/subscriptions/current`, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-        },
-      });
-      const data = await response.json();
-      if (data.success) {
-        setCurrentPlan(data.subscription.tier);
+      const status = await getSubscriptionStatus();
+      if (status && status.tier) {
+        setCurrentPlan(status.tier);
       }
     } catch (error) {
       console.error('Failed to fetch current plan:', error);
@@ -68,71 +109,44 @@ export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: P
 
   const handleSelectPlan = async (planName: string) => {
     if (planName === 'free') {
-      // Free tier is default, just continue
       onSubscriptionComplete();
       return;
     }
 
-    setLoading(true);
+    setPurchasing(true);
     try {
-      const response = await fetch(`${API_URL}/api/subscriptions/checkout`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ tier: planName, billing }),
-      });
+      const packageId = billing === 'monthly' ? 'monthly' : 'annual';
+      const tier = planName === 'premium' ? 'premium' : 'family';
+      const purchaseSuccess = await purchaseSubscription(packageId, tier);
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to create checkout session');
+      if (!purchaseSuccess) {
+        // Purchase was cancelled or failed - don't update UI
+        return;
       }
 
-      // In production, this would redirect to Stripe checkout
-      // For now, simulate successful subscription
-      Alert.alert(
-        'Payment Integration',
-        'Stripe checkout would open here. For testing, subscription will be activated.',
-        [
-          {
-            text: 'Simulate Success',
-            onPress: () => simulateSubscription(planName),
-          },
-          {
-            text: 'Cancel',
-            style: 'cancel',
-          },
-        ]
-      );
-    } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to start checkout');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const simulateSubscription = async (tier: string) => {
-    try {
-      // Simulate webhook completion
-      const response = await fetch(`${API_URL}/api/subscriptions/webhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'checkout.session.completed',
-          data: { userId: user.id, tier, billing },
-        }),
-      });
-
-      const data = await response.json();
-      if (data.success) {
-        setCurrentPlan(tier);
-        Alert.alert('Success', `You are now on the ${tier.charAt(0).toUpperCase() + tier.slice(1)} plan!`);
+      // Server-side verification — only update UI if backend confirms
+      const verification = await verifyPurchaseWithBackend();
+      if (verification.success && verification.tier) {
+        setCurrentPlan(verification.tier);
+        Alert.alert('Success', `You are now on the ${verification.tier.charAt(0).toUpperCase() + verification.tier.slice(1)} plan!`);
         onSubscriptionComplete();
+      } else {
+        Alert.alert('Verification Pending', 'Your purchase is being verified. Please restart the app in a moment.');
+        // Refresh the subscription status in the background
+        const status = await getSubscriptionStatus();
+        if (status.tier !== 'free') {
+          setCurrentPlan(status.tier);
+          onSubscriptionComplete();
+        }
       }
-    } catch (error) {
-      Alert.alert('Error', 'Failed to activate subscription');
+    } catch (error: any) {
+      if (error.message?.includes(' cancelled') || error.message?.includes('canceled')) {
+        // User cancelled, don't show error
+        return;
+      }
+      Alert.alert('Error', error.message || 'Failed to complete purchase');
+    } finally {
+      setPurchasing(false);
     }
   };
 
@@ -190,6 +204,14 @@ export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: P
             </View>
           </TouchableOpacity>
         </View>
+
+        {billingUnavailable && (
+          <View style={styles.unavailableBanner}>
+            <Text style={styles.unavailableText}>
+              Purchases unavailable on this device
+            </Text>
+          </View>
+        )}
       </View>
 
       {Object.entries(plans).map(([key, plan]) => {
@@ -258,10 +280,10 @@ export function PricingScreen({ user, token, onSubscriptionComplete, onSkip }: P
                 isCurrentPlan && styles.ctaCurrent,
               ]}
               onPress={() => handleSelectPlan(key)}
-              disabled={loading || isCurrentPlan}
+              disabled={purchasing || isCurrentPlan || (billingUnavailable && key !== 'free')}
             >
-              {loading ? (
-                <ActivityIndicator color={isPremium ? 'white' : '#1e293b'} />
+              {purchasing ? (
+                <ActivityIndicator color="white" />
               ) : (
                 <Text style={[
                   styles.ctaText,
@@ -521,5 +543,20 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6366f1',
     fontWeight: '500',
+  },
+  unavailableBanner: {
+    marginTop: 16,
+    backgroundColor: '#fef3c7',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: '#f59e0b',
+  },
+  unavailableText: {
+    fontSize: 14,
+    color: '#92400e',
+    textAlign: 'center',
+    fontWeight: '600',
   },
 });
